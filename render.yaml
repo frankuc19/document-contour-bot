@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: document-contour-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /health
