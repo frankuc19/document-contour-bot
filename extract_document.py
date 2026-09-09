@@ -1,8 +1,10 @@
 """
 Descarga una imagen desde una URL (p. ej. un link de S3 de un documento tipo
 licencia/credencial) y "rescata" la foto de la persona que está dentro del
-documento: busca el contorno rectangular tipo foto-carnet (tamaño intermedio,
-proporción retrato) y recorta solo esa región.
+documento: primero busca la cara con el detector de rostros de OpenCV y
+recorta un encuadre tipo retrato alrededor de ella. Si no encuentra una cara
+con suficiente confianza, cae de respaldo a un heurístico de contorno
+(recuadro rectangular tipo foto-carnet, descartando QR/códigos de barras).
 
 Uso:
     python extract_document.py <url> [--output salida.jpg] [--debug]
@@ -62,8 +64,83 @@ PHOTO_AREA_RANGE = (0.02, 0.45)
 # Qué tan "rectangular" debe ser el contorno (area del contorno / area del
 # bounding box). Las fotos con esquinas redondeadas siguen siendo altas.
 MIN_EXTENT = 0.55
-# Padding relativo agregado alrededor del recorte final.
+# Densidad máxima de píxeles de borde dentro del recuadro (proporción de
+# píxeles Canny "encendidos"). Un código QR/barras es un patrón de alta
+# frecuencia con densidad muy alta (~0.5+); una foto de persona es mucho
+# más lisa (~0.1-0.2). Este filtro evita confundir un QR con la foto.
+MAX_EDGE_DENSITY = 0.35
+# Padding relativo agregado alrededor del recorte final (método de contorno).
 CROP_PADDING_RATIO = 0.02
+
+# --- Detección de rostro (método principal) ---------------------------
+
+# Confianza mínima (levelWeight de Haar Cascade) para aceptar una cara como
+# la foto del documento y no una falsa detección (fondo, mano, textura).
+# Calibrado con fotos reales: caras verdaderas de credencial suelen dar
+# ~9-11, falsos positivos de fondo/mano suelen dar <3.
+MIN_FACE_CONFIDENCE = 4.0
+# Márgenes para expandir la caja de la cara (detectada muy ajustada, solo
+# ojos-nariz-boca) a un encuadre tipo retrato de credencial (cabeza+hombros).
+# Relativos al ancho/alto de la caja de la cara.
+FACE_MARGIN_LEFT = 0.6
+FACE_MARGIN_RIGHT = 0.5
+FACE_MARGIN_TOP = 0.35
+FACE_MARGIN_BOTTOM = 0.75
+
+_face_cascade: cv2.CascadeClassifier | None = None
+
+
+def _get_face_cascade() -> cv2.CascadeClassifier:
+    global _face_cascade
+    if _face_cascade is None:
+        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        _face_cascade = cv2.CascadeClassifier(path)
+    return _face_cascade
+
+
+def find_face_box(processed_image: np.ndarray):
+    """
+    Busca la cara más confiable en la imagen (ya reescalada) usando Haar
+    Cascade. Devuelve (x, y, w, h) en coordenadas de la imagen reescalada,
+    o None si no hay ninguna detección con suficiente confianza.
+    """
+    gray = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    h, w = gray.shape[:2]
+    min_size = (max(20, int(w * 0.03)), max(20, int(h * 0.03)))
+
+    cascade = _get_face_cascade()
+    rects, _reject_levels, level_weights = cascade.detectMultiScale3(
+        gray,
+        scaleFactor=1.05,
+        minNeighbors=5,
+        minSize=min_size,
+        outputRejectLevels=True,
+    )
+
+    if len(rects) == 0:
+        return None
+
+    best_idx = int(np.argmax(level_weights))
+    if level_weights[best_idx] < MIN_FACE_CONFIDENCE:
+        return None
+
+    x, y, fw, fh = rects[best_idx]
+    return int(x), int(y), int(fw), int(fh)
+
+
+def expand_face_to_portrait(
+    x: float, y: float, w: float, h: float, img_w: int, img_h: int
+):
+    """Expande la caja ajustada de la cara a un encuadre cabeza+hombros."""
+    x0 = max(0, int(x - w * FACE_MARGIN_LEFT))
+    y0 = max(0, int(y - h * FACE_MARGIN_TOP))
+    x1 = min(img_w, int(x + w + w * FACE_MARGIN_RIGHT))
+    y1 = min(img_h, int(y + h + h * FACE_MARGIN_BOTTOM))
+    return x0, y0, x1, y1
+
+
+# --- Contorno tipo foto-carnet (método de respaldo) --------------------
 
 
 def find_photo_region(processed_image: np.ndarray):
@@ -114,6 +191,12 @@ def find_photo_region(processed_image: np.ndarray):
         if extent < MIN_EXTENT:
             continue
 
+        edge_density = (edges[y : y + h, x : x + w] > 0).mean()
+        if edge_density > MAX_EDGE_DENSITY:
+            # Patrón de alta frecuencia (QR, código de barras, texto denso):
+            # no es una foto de persona.
+            continue
+
         # Prioriza contornos grandes cuya proporción se acerque a la de una
         # foto de credencial típica.
         aspect_penalty = abs(aspect - PHOTO_ASPECT_IDEAL)
@@ -131,38 +214,48 @@ def find_photo_region(processed_image: np.ndarray):
 def extract_document(image: np.ndarray, debug_path: Path | None = None) -> np.ndarray:
     """Detecta la foto de la persona dentro del documento y la recorta."""
     processed, ratio = resize_for_processing(image)
-    box, all_contours = find_photo_region(processed)
+    img_h, img_w = image.shape[:2]
+
+    face_box = find_face_box(processed)
+    photo_box, all_contours = find_photo_region(processed)
 
     if debug_path is not None:
         debug_img = processed.copy()
         cv2.drawContours(debug_img, all_contours, -1, (0, 255, 0), 1)
-        if box is not None:
-            x, y, w, h = box
+        if photo_box is not None:
+            x, y, w, h = photo_box
             cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        if face_box is not None:
+            x, y, w, h = face_box
+            cv2.rectangle(debug_img, (x, y), (x + w, y + h), (255, 0, 0), 2)
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(debug_path), debug_img)
 
-    if box is None:
-        print(
-            "  ! No se detectó una foto de credencial dentro del documento; "
-            "se devuelve la imagen completa.",
-            file=sys.stderr,
-        )
-        return image
+    if face_box is not None:
+        x, y, w, h = face_box
+        x, y, w, h = x * ratio, y * ratio, w * ratio, h * ratio
+        x0, y0, x1, y1 = expand_face_to_portrait(x, y, w, h, img_w, img_h)
+        return image[y0:y1, x0:x1]
 
-    # Escala el recuadro de vuelta a la resolución original y agrega un
-    # pequeño padding para no cortar el borde de la foto.
-    x, y, w, h = box
-    x, y, w, h = x * ratio, y * ratio, w * ratio, h * ratio
-    pad_x, pad_y = w * CROP_PADDING_RATIO, h * CROP_PADDING_RATIO
+    if photo_box is not None:
+        # Escala el recuadro de vuelta a la resolución original y agrega un
+        # pequeño padding para no cortar el borde de la foto.
+        x, y, w, h = photo_box
+        x, y, w, h = x * ratio, y * ratio, w * ratio, h * ratio
+        pad_x, pad_y = w * CROP_PADDING_RATIO, h * CROP_PADDING_RATIO
 
-    img_h, img_w = image.shape[:2]
-    x0 = max(0, int(x - pad_x))
-    y0 = max(0, int(y - pad_y))
-    x1 = min(img_w, int(x + w + pad_x))
-    y1 = min(img_h, int(y + h + pad_y))
+        x0 = max(0, int(x - pad_x))
+        y0 = max(0, int(y - pad_y))
+        x1 = min(img_w, int(x + w + pad_x))
+        y1 = min(img_h, int(y + h + pad_y))
+        return image[y0:y1, x0:x1]
 
-    return image[y0:y1, x0:x1]
+    print(
+        "  ! No se detectó una cara ni una foto de credencial en el "
+        "documento; se devuelve la imagen completa.",
+        file=sys.stderr,
+    )
+    return image
 
 
 def filename_from_url(url: str) -> str:
