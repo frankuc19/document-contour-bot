@@ -1,0 +1,71 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "18de6326-24b1-41ba-ab7e-4186f8f4c680",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [0, 0],
+      "id": "9a02fd52-2afe-467b-847a-6f57654208b7",
+      "name": "Webhook",
+      "webhookId": "18de6326-24b1-41ba-ab7e-4186f8f4c680"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://document-contour-bot.onrender.com/extract",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"url\": $json.body.url_licencia_conducir } }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 0],
+      "id": "b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e",
+      "name": "Extraer foto (Render)"
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "inputFieldName": "data",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [440, 0],
+      "id": "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f",
+      "name": "Responder con la foto"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          { "node": "Extraer foto (Render)", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Extraer foto (Render)": {
+      "main": [
+        [
+          { "node": "Responder con la foto", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "497f4f91e32c3010a03ab2aa6f14b5e32e3392af2460c35a2ce9dceace37567e"
+  }
+}
