@@ -1,11 +1,10 @@
 services:
   - type: web
     name: document-contour-bot
-    env: python
+    env: docker
+    dockerfilePath: ./Dockerfile
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
-    startCommand: gunicorn app:app
     healthCheckPath: /health
     envVars:
       - key: SUPABASE_URL
