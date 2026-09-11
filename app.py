@@ -31,6 +31,7 @@ import uuid
 import cv2
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file
+from PIL import Image
 from playwright.sync_api import sync_playwright
 from supabase import Client, create_client
 
@@ -43,6 +44,9 @@ app = Flask(__name__)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "gafetes")
+
+# Tamaño aproximado al que se busca ajustar cada gafete generado.
+TARGET_BADGE_BYTES = 40_000
 
 _playwright = None
 _browser = None
@@ -59,6 +63,36 @@ def get_browser():
             _playwright = sync_playwright().start()
             _browser = _playwright.chromium.launch(args=["--no-sandbox"])
     return _browser
+
+
+def optimize_png(png_bytes: bytes, target_bytes: int = TARGET_BADGE_BYTES) -> bytes:
+    """
+    Ajusta un PNG a ~target_bytes: primero con compresión sin pérdida
+    (optimize=True), y si no alcanza, reduciendo la paleta de colores
+    progresivamente (funciona bien para diseños planos tipo gafete/badge,
+    a costa de algo de banding en degradados si hace falta apretar mucho).
+    """
+    img = Image.open(io.BytesIO(png_bytes))
+    img.load()
+
+    def encode(im: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    best = encode(img)
+    if len(best) <= target_bytes:
+        return best
+
+    rgba = img.convert("RGBA")
+    for colors in (256, 128, 64, 32, 16):
+        quantized = rgba.quantize(colors=colors, method=Image.MEDIANCUT)
+        candidate = encode(quantized)
+        best = candidate
+        if len(candidate) <= target_bytes:
+            break
+
+    return best
 
 
 def get_supabase() -> Client:
@@ -107,6 +141,11 @@ def badge():
             page.close()
     except Exception as exc:  # noqa: BLE001
         return jsonify(error=f"No se pudo renderizar el HTML: {exc}"), 500
+
+    try:
+        png_bytes = optimize_png(png_bytes)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify(error=f"No se pudo optimizar el PNG: {exc}"), 500
 
     filename = f"{uuid.uuid4()}.png"
     try:

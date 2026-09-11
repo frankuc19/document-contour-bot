@@ -6,3 +6,4 @@ gunicorn>=22.0,<23
 playwright==1.62.0
 supabase>=2.6,<3
 python-dotenv>=1.0,<2
+pillow>=10.4,<11
