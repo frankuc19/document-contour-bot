@@ -101,8 +101,8 @@ def _get_face_cascade() -> cv2.CascadeClassifier:
 def find_face_box(processed_image: np.ndarray):
     """
     Busca la cara más confiable en la imagen (ya reescalada) usando Haar
-    Cascade. Devuelve (x, y, w, h) en coordenadas de la imagen reescalada,
-    o None si no hay ninguna detección con suficiente confianza.
+    Cascade. Devuelve (x, y, w, h, confianza) de la mejor detección, o
+    None si no hay ninguna.
     """
     gray = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
@@ -122,11 +122,76 @@ def find_face_box(processed_image: np.ndarray):
         return None
 
     best_idx = int(np.argmax(level_weights))
-    if level_weights[best_idx] < MIN_FACE_CONFIDENCE:
+    x, y, fw, fh = rects[best_idx]
+    return int(x), int(y), int(fw), int(fh), float(level_weights[best_idx])
+
+
+# Ángulos (en grados) que se prueban cuando la cara no aparece derecha: fotos
+# tomadas con el documento girado (sobre una mesa, en la mano, etc.) hacen
+# que Haar Cascade falle porque no tolera más de ~15-20° de inclinación.
+FACE_SEARCH_ANGLES = (
+    0,
+    90,
+    -90,
+    180,
+    10,
+    -10,
+    20,
+    -20,
+    30,
+    -30,
+    40,
+    -40,
+    50,
+    -50,
+)
+
+
+def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
+    """Rota la imagen `angle` grados alrededor de su centro sin recortarla
+    (expande el lienzo para que no se pierdan las esquinas)."""
+    if angle == 0:
+        return image
+
+    h, w = image.shape[:2]
+    center = (w / 2, h / 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+
+    matrix[0, 2] += (new_w / 2) - center[0]
+    matrix[1, 2] += (new_h / 2) - center[1]
+
+    return cv2.warpAffine(
+        image, matrix, (new_w, new_h), borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def find_best_face(processed_image: np.ndarray):
+    """
+    Prueba find_face_box en varios ángulos de rotación y devuelve la mejor
+    detección global: (angulo, x, y, w, h, ancho_rotado, alto_rotado), o
+    None si ningún ángulo produjo una cara con suficiente confianza.
+    """
+    best = None  # (weight, angle, x, y, w, h, rot_w, rot_h)
+    for angle in FACE_SEARCH_ANGLES:
+        rotated = rotate_image(processed_image, angle)
+        result = find_face_box(rotated)
+        if result is None:
+            continue
+        x, y, w, h, weight = result
+        if best is None or weight > best[0]:
+            rot_h, rot_w = rotated.shape[:2]
+            best = (weight, angle, x, y, w, h, rot_w, rot_h)
+
+    if best is None or best[0] < MIN_FACE_CONFIDENCE:
         return None
 
-    x, y, fw, fh = rects[best_idx]
-    return int(x), int(y), int(fw), int(fh)
+    _weight, angle, x, y, w, h, rot_w, rot_h = best
+    return angle, x, y, w, h, rot_w, rot_h
 
 
 def expand_face_to_portrait(
@@ -212,30 +277,47 @@ def find_photo_region(processed_image: np.ndarray):
 
 
 def extract_document(image: np.ndarray, debug_path: Path | None = None) -> np.ndarray:
-    """Detecta la foto de la persona dentro del documento y la recorta."""
+    """
+    Detecta la foto de la persona dentro del documento y la recorta. Si el
+    documento está girado (foto tomada en ángulo), primero lo orienta antes
+    de recortar (ver find_best_face / FACE_SEARCH_ANGLES).
+    """
     processed, ratio = resize_for_processing(image)
     img_h, img_w = image.shape[:2]
 
-    face_box = find_face_box(processed)
+    face_result = find_best_face(processed)
     photo_box, all_contours = find_photo_region(processed)
 
     if debug_path is not None:
-        debug_img = processed.copy()
-        cv2.drawContours(debug_img, all_contours, -1, (0, 255, 0), 1)
-        if photo_box is not None:
-            x, y, w, h = photo_box
-            cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        if face_box is not None:
-            x, y, w, h = face_box
-            cv2.rectangle(debug_img, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        if face_result is not None:
+            angle, fx, fy, fw, fh, _rot_w, _rot_h = face_result
+            debug_img = rotate_image(processed, angle).copy()
+            cv2.rectangle(debug_img, (fx, fy), (fx + fw, fy + fh), (255, 0, 0), 2)
+            if angle == 0:
+                cv2.drawContours(debug_img, all_contours, -1, (0, 255, 0), 1)
+                if photo_box is not None:
+                    px, py, pw, ph = photo_box
+                    cv2.rectangle(
+                        debug_img, (px, py), (px + pw, py + ph), (0, 0, 255), 2
+                    )
+        else:
+            debug_img = processed.copy()
+            cv2.drawContours(debug_img, all_contours, -1, (0, 255, 0), 1)
+            if photo_box is not None:
+                px, py, pw, ph = photo_box
+                cv2.rectangle(
+                    debug_img, (px, py), (px + pw, py + ph), (0, 0, 255), 2
+                )
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(debug_path), debug_img)
 
-    if face_box is not None:
-        x, y, w, h = face_box
+    if face_result is not None:
+        angle, x, y, w, h, _rot_w, _rot_h = face_result
+        rotated_full = rotate_image(image, angle)
+        rfh, rfw = rotated_full.shape[:2]
         x, y, w, h = x * ratio, y * ratio, w * ratio, h * ratio
-        x0, y0, x1, y1 = expand_face_to_portrait(x, y, w, h, img_w, img_h)
-        return image[y0:y1, x0:x1]
+        x0, y0, x1, y1 = expand_face_to_portrait(x, y, w, h, rfw, rfh)
+        return rotated_full[y0:y1, x0:x1]
 
     if photo_box is not None:
         # Escala el recuadro de vuelta a la resolución original y agrega un
