@@ -170,27 +170,52 @@ def rotate_image(image: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
+# Ancho usado para el barrido rápido de ángulos (ver find_best_face). Correr
+# Haar Cascade en los 14 ángulos a resolución completa (PROCESSING_WIDTH)
+# era demasiado lento en el CPU compartido de Render: superaba el timeout
+# de gunicorn (~30s) y el request moría con 500/502. A esta resolución
+# mucho más chica, el barrido completo es barato; el ángulo ganador se
+# vuelve a probar una sola vez a resolución completa para un recuadro
+# preciso.
+COARSE_SEARCH_WIDTH = 350
+
+
 def find_best_face(processed_image: np.ndarray):
     """
-    Prueba find_face_box en varios ángulos de rotación y devuelve la mejor
-    detección global: (angulo, x, y, w, h, ancho_rotado, alto_rotado), o
-    None si ningún ángulo produjo una cara con suficiente confianza.
+    Encuentra el ángulo/recuadro de la cara con más confianza, probando
+    varias rotaciones. Devuelve (angulo, x, y, w, h, ancho_rotado,
+    alto_rotado) en coordenadas de `processed_image` rotada ese ángulo, o
+    None si no se encontró ninguna cara confiable en ningún ángulo.
     """
-    best = None  # (weight, angle, x, y, w, h, rot_w, rot_h)
+    coarse_image, _ratio = resize_for_processing(
+        processed_image, width=COARSE_SEARCH_WIDTH
+    )
+
+    coarse_best = None  # (weight, angle)
     for angle in FACE_SEARCH_ANGLES:
-        rotated = rotate_image(processed_image, angle)
+        rotated = rotate_image(coarse_image, angle)
         result = find_face_box(rotated)
         if result is None:
             continue
-        x, y, w, h, weight = result
-        if best is None or weight > best[0]:
-            rot_h, rot_w = rotated.shape[:2]
-            best = (weight, angle, x, y, w, h, rot_w, rot_h)
+        _x, _y, _w, _h, weight = result
+        if coarse_best is None or weight > coarse_best[0]:
+            coarse_best = (weight, angle)
 
-    if best is None or best[0] < MIN_FACE_CONFIDENCE:
+    if coarse_best is None or coarse_best[0] < MIN_FACE_CONFIDENCE:
         return None
 
-    _weight, angle, x, y, w, h, rot_w, rot_h = best
+    _weight, angle = coarse_best
+
+    # Refinamiento: repite la detección a resolución completa solo en el
+    # ángulo ganador, para un recuadro preciso (el barrido rápido ya nos
+    # dijo cuál ángulo probar, así que esto es una sola pasada extra).
+    rotated_full = rotate_image(processed_image, angle)
+    result = find_face_box(rotated_full)
+    if result is None or result[4] < MIN_FACE_CONFIDENCE:
+        return None
+
+    x, y, w, h, _weight = result
+    rot_h, rot_w = rotated_full.shape[:2]
     return angle, x, y, w, h, rot_w, rot_h
 
 
