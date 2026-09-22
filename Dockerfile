@@ -26,7 +26,7 @@ ENV PORT=8000
 EXPOSE 8000
 
 # --timeout 90: margen extra sobre el default de gunicorn (30s). La
-# búsqueda de rostro en varios ángulos (extract_document.py) ya se
-# optimizó para ser rápida, pero en el CPU compartido de Render un caso
-# lento no debería morir con 500 por el timeout por defecto.
+# detección de rostro (extract_document.py) corre en unas pocas
+# orientaciones; el margen evita un 500 si el CPU compartido de Render
+# va lento.
 CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --timeout 90"]
